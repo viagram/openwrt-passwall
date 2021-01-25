@@ -44,27 +44,24 @@ end
 local CONFIG = {}
 do
 	local function import_config(protocol)
-		local node_num = ucic2:get(application, "@global_other[0]", protocol .. "_node_num") or 1
-		for i = 1, node_num, 1 do
-			local name = string.upper(protocol)
-			local szType = "@global[0]"
-			local option = protocol .. "_node" .. i
-			
-			local node = ucic2:get(application, szType, option)
-			local currentNode
-			if node then
-				currentNode = ucic2:get_all(application, node)
-			end
-			CONFIG[#CONFIG + 1] = {
-				log = true,
-				remarks = name .. "节点" .. i,
-				node = node,
-				currentNode = currentNode,
-				set = function(server)
-					ucic2:set(application, szType, option, server)
-				end
-			}
+		local name = string.upper(protocol)
+		local szType = "@global[0]"
+		local option = protocol .. "_node"
+		
+		local node = ucic2:get(application, szType, option)
+		local currentNode
+		if node then
+			currentNode = ucic2:get_all(application, node)
 		end
+		CONFIG[#CONFIG + 1] = {
+			log = true,
+			remarks = name .. "节点",
+			node = node,
+			currentNode = currentNode,
+			set = function(server)
+				ucic2:set(application, szType, option, server)
+			end
+		}
 	end
 	import_config("tcp")
 	import_config("udp")
@@ -85,21 +82,11 @@ do
 		}
 	end)
 
-	local tcp_main1 = ucic2:get(application, "@auto_switch[0]", "tcp_main1") or "nil"
-	CONFIG[#CONFIG + 1] = {
-		log = false,
-		remarks = "自动切换TCP_1主节点",
-		currentNode = ucic2:get_all(application, tcp_main1),
-		set = function(server)
-			ucic2:set(application, "@auto_switch[0]", "tcp_main1", server)
-		end
-	}
-
-	local tcp_node1_table = ucic2:get(application, "@auto_switch[0]", "tcp_node1")
-	if tcp_node1_table then
+	local tcp_node_table = ucic2:get(application, "@auto_switch[0]", "tcp_node")
+	if tcp_node_table then
 		local nodes = {}
 		local new_nodes = {}
-		for k,v in ipairs(tcp_node1_table) do
+		for k,v in ipairs(tcp_node_table) do
 			local node = v
 			local currentNode
 			if node then
@@ -120,14 +107,14 @@ do
 			}
 		end
 		CONFIG[#CONFIG + 1] = {
-			remarks = "自动切换TCP_1节点列表",
+			remarks = "自动切换TCP节点列表",
 			nodes = nodes,
 			new_nodes = new_nodes,
 			set = function()
 				for kk, vv in pairs(CONFIG) do
 					if (vv.remarks == "自动切换TCP_1节点列表") then
 						log("刷新自动切换列表")
-						ucic2:set_list(application, "@auto_switch[0]", "tcp_node1", vv.new_nodes)
+						ucic2:set_list(application, "@auto_switch[0]", "tcp_node", vv.new_nodes)
 					end
 				end
 			end
@@ -164,6 +151,20 @@ do
 				remarks = "分流默认节点",
 				set = function(server)
 					ucic2:set(application, node_id, "default_node", server)
+				end
+			}
+
+			local main_node_id = node.main_node
+			local main_node
+			if main_node_id then
+				main_node = ucic2:get_all(application, main_node_id)
+			end
+			CONFIG[#CONFIG + 1] = {
+				log = false,
+				currentNode = main_node,
+				remarks = "分流默认前置代理节点",
+				set = function(server)
+					ucic2:set(application, node_id, "main_node", server)
 				end
 			}
 		elseif node.protocol and node.protocol == '_balancing' then
@@ -343,10 +344,7 @@ local function processData(szType, content, add_mode)
 		result.remarks = base64Decode(params.remarks)
 	elseif szType == 'vmess' then
 		local info = jsonParse(content)
-		result.type = 'V2ray'
-		if api.is_finded("xray") then
-			result.type = 'Xray'
-		end
+		result.type = 'Xray'
 		result.address = info.add
 		result.port = info.port
 		result.protocol = 'vmess'
