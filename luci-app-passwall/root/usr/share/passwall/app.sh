@@ -21,6 +21,7 @@ IS_DEFAULT_DNS=0
 LOCAL_DNS=
 DEFAULT_DNS=
 NO_PROXY=
+PROXY_IPV6=0
 use_tcp_node_resolve_dns=0
 use_udp_node_resolve_dns=0
 LUA_API_PATH=/usr/lib/lua/luci/model/cbi/$CONFIG/api
@@ -57,11 +58,11 @@ get_host_ip() {
 	local isip=""
 	local ip=$host
 	if [ "$1" == "ipv6" ]; then
-		isip=$(echo $host | grep -E "([[a-f0-9]{1,4}(:[a-f0-9]{1,4}){7}|[a-f0-9]{1,4}(:[a-f0-9]{1,4}){0,7}::[a-f0-9]{0,4}(:[a-f0-9]{1,4}){0,7}])")
+		isip=$(echo $host | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}")
 		if [ -n "$isip" ]; then
 			isip=$(echo $host | cut -d '[' -f2 | cut -d ']' -f1)
 		else
-			isip=$(echo $host | grep -E "([a-f0-9]{1,4}(:[a-f0-9]{1,4}){7}|[a-f0-9]{1,4}(:[a-f0-9]{1,4}){0,7}::[a-f0-9]{0,4}(:[a-f0-9]{1,4}){0,7})")
+			isip=$(echo $host | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}")
 		fi
 	else
 		isip=$(echo $host | grep -E "([0-9]{1,3}[\.]){3}[0-9]{1,3}")
@@ -131,6 +132,16 @@ hosts_foreach() {
 		__ret=$?
 		[ ${__ret} -ge ${ERROR_NO_CATCH:-1} ] && return ${__ret}
 	done
+}
+
+check_host() {
+	local f=${1}
+	a=$(echo $f | grep "\/")
+	[ -n "$a" ] && return 1
+	# 判断是否包含汉字~
+	local tmp=$(echo -n $f | awk '{print gensub(/[!-~]/,"","g",$0)}')
+	[ -n "$tmp" ] && return 1
+	return 0
 }
 
 get_first_dns() {
@@ -217,8 +228,10 @@ TCP_NODE=$(config_t_get global tcp_node nil)
 UDP_REDIR_PORT=1051
 UDP_NODE=$(config_t_get global udp_node nil)
 
-[ "$UDP_NODE" == "tcp_" ] && UDP_NODE=$TCP_NODE
-[ "$UDP_NODE" == "tcp" ] && UDP_REDIR_PORT=$TCP_REDIR_PORT
+[ "$UDP_NODE" == "tcp" ] && {
+	UDP_NODE=$TCP_NODE
+	TCP_UDP=1
+}
 
 TCP_REDIR_PORTS=$(config_t_get global_forwarding tcp_redir_ports '80,443')
 UDP_REDIR_PORTS=$(config_t_get global_forwarding udp_redir_ports '1:65535')
@@ -271,7 +284,18 @@ load_config() {
 		LOCAL_DNS="${DEFAULT_DNS:-119.29.29.29}"
 		IS_DEFAULT_DNS=1
 	fi
-	PROXY_IPV6=$(config_t_get global_forwarding proxy_ipv6 0)
+	
+	local ipv6_tproxy=$(config_t_get global_other ipv6_tproxy 0)
+	if [ $ipv6_tproxy == "1" ]; then
+		local NODE_TYPE=$(echo $(config_n_get $TCP_NODE type) | tr 'A-Z' 'a-z')
+		if [ $NODE_TYPE == "xray" ]; then
+			PROXY_IPV6=1
+			echolog "节点类型:$NODE_TYPE，开启实验性IPv6透明代理(TProxy)..."
+		else
+			echolog "节点类型:$NODE_TYPE，暂不支持IPv6透明代理(TProxy)..."
+		fi
+	fi
+	
 	export XRAY_LOCATION_ASSET=$(config_t_get global_rules xray_location_asset "/usr/share/xray/")
 	mkdir -p /var/etc $TMP_PATH $TMP_BIN_PATH $TMP_ID_PATH $TMP_PORT_PATH $TMP_ROUTE_PATH
 	return 0
@@ -295,25 +319,28 @@ run_socks() {
 		server_host="127.0.0.1"
 		port=$relay_port
 	}
-	local msg tmp
+	local error_msg tmp
 
 	if [ -n "$server_host" ] && [ -n "$port" ]; then
-		server_host=$(host_from_url "$server_host")
-		[ -n "$(echo -n $server_host | awk '{print gensub(/[!-~]/,"","g",$0)}')" ] && msg="$remarks，非法的代理服务器地址，无法启动 ！"
-		tmp="（${server_host}:${port}）"
+		check_host $server_host
+		[ $? != 0 ] && {
+			echolog "  - Socks节点：[$remarks]${server_host} 是非法的服务器地址，无法启动！"
+			return 1
+		}
+		tmp="${server_host}:${port}"
 	else
-		msg="某种原因，此 Socks 服务的相关配置已失联，启动中止！"
+		error_msg="某种原因，此 Socks 服务的相关配置已失联，启动中止！"
 	fi
 
 	if [ "$type" == "xray" ] && ([ -n "$(config_n_get $node balancing_node)" ] || [ "$(config_n_get $node default_node)" != "_direct" -a "$(config_n_get $node default_node)" != "_blackhole" ]); then
-		unset msg
+		unset error_msg
 	fi
 
-	[ -n "${msg}" ] && {
-		[ "$bind" != "127.0.0.1" ] && echolog "  - 启动中止 ${bind}:${socks_port} ${msg}"
+	[ -n "${error_msg}" ] && {
+		[ "$bind" != "127.0.0.1" ] && echolog "  - Socks节点：[$remarks]${tmp}，启动中止 ${bind}:${socks_port} ${error_msg}"
 		return 1
 	}
-	[ "$bind" != "127.0.0.1" ] && echolog "  - 启动 ${bind}:${socks_port}  - 节点：$remarks${tmp}"
+	[ "$bind" != "127.0.0.1" ] && echolog "  - Socks节点：[$remarks]${tmp}，启动 ${bind}:${socks_port}"
 
 	case "$type" in
 	socks|\
@@ -339,18 +366,28 @@ run_socks() {
 	;;
 	brook)
 		local protocol=$(config_n_get $node protocol client)
-		local brook_tls=$(config_n_get $node brook_tls 0)
+		local prefix=""
 		[ "$protocol" == "wsclient" ] && {
-			[ "$brook_tls" == "1" ] && server_host="wss://${server_host}" || server_host="ws://${server_host}"
+			prefix="ws://"
+			local brook_tls=$(config_n_get $node brook_tls 0)
+			[ "$brook_tls" == "1" ] && {
+				prefix="wss://"
+				protocol="wssclient"
+			}
+			local ws_path=$(config_n_get $node ws_path "/ws")
 		}
-		ln_start_bin "$(first_type $(config_t_get global_app brook_file) brook)" "brook_SOCKS_${flag}" $log_file "$protocol" --socks5 "$bind:$socks_port" -s "$server_host:$port" -p "$(config_n_get $node password)"
+		server_host=${prefix}${server_host}
+		ln_start_bin "$(first_type $(config_t_get global_app brook_file) brook)" "brook_SOCKS_${flag}" $log_file "$protocol" --socks5 "$bind:$socks_port" -s "${server_host}:${port}${ws_path}" -p "$(config_n_get $node password)"
 	;;
-	ss|ssr)
-		ss_program="$(first_type ${type}local ${type}-local)"
-		ss_extra_arg="-u"
-		[ "$(printf '%s' "$ss_program" | awk -F '/' '{print $NF}')" = "${type}local" ] && unset ss_extra_arg
+	ssr)
+		lua $API_GEN_SS -node $node -local_addr "0.0.0.0" -local_port $socks_port -server_host $server_host -server_port $port > $config_file
+		ln_start_bin "$(first_type ssr-local)" "ssr-local" $log_file -c "$config_file" -v
+	;;
+	ss)
+		local bin="ss-local"
+		[ "$(config_n_get $node ss_rust 0)" = "1" ] && bin="sslocal"
 		lua $API_GEN_SS -node $node -local_addr "0.0.0.0" -local_port $socks_port -server_host $server_host -server_port $port -protocol socks -mode tcp_and_udp > $config_file
-		ln_start_bin "$ss_program" "${type}-local" $log_file -c "$config_file" -v $ss_extra_arg
+		ln_start_bin "$(first_type $bin ss-local)" "$bin" $log_file -c "$config_file" -v
 	;;
 	esac
 
@@ -377,16 +414,13 @@ run_redir() {
 	local remarks=$(config_n_get $node remarks)
 	local server_host=$(config_n_get $node address)
 	local port=$(config_n_get $node port)
-	[ -n "$server_host" -a -n "$port" ] && {
-		# 判断节点服务器地址是否URL并去掉~
-		local server_host=$(host_from_url "$server_host")
-		# 判断节点服务器地址是否包含汉字~
-		local tmp=$(echo -n $server_host | awk '{print gensub(/[!-~]/,"","g",$0)}')
-		[ -n "$tmp" ] && {
-			echolog "$remarks节点，非法的服务器地址，无法启动！"
+	[ -n "$server_host" ] && [ -n "$port" ] && {
+		check_host $server_host
+		[ $? != 0 ] && {
+			echolog "${REDIR_TYPE}节点：[$remarks]${server_host} 是非法的服务器地址，无法启动！"
 			return 1
 		}
-		[ "$bind" != "127.0.0.1" ] && echolog "${REDIR_TYPE}节点：$remarks，节点：${server_host}:${port}，监听端口：$local_port"
+		[ "$bind" != "127.0.0.1" ] && echolog "${REDIR_TYPE}节点：[$remarks]${server_host}:${port}，监听端口：$local_port"
 	}
 	eval ${REDIR_TYPE}_NODE_PORT=$port
 
@@ -424,15 +458,18 @@ run_redir() {
 			if [ "$protocol" == "wsclient" ]; then
 				echolog "Brook的WebSocket不支持UDP转发！"
 			else
-				ln_start_bin "$(first_type $(config_t_get global_app brook_file) brook)" "brook_udp" $log_file tproxy -l ":$local_port" -s "$server_host:$port" -p "$(config_n_get $node password)"
+				ln_start_bin "$(first_type $(config_t_get global_app brook_file) brook)" "brook_udp" $log_file tproxy -l ":$local_port" -s "$server_host:$port" -p "$(config_n_get $node password)" --doNotRunScripts
 			fi
 		;;
-		ss|ssr)
-			ss_program="$(first_type ${type}local ${type}-redir)"
-			ss_extra_arg="-U"
-			[ "$(printf '%s' "$ss_program" | awk -F '/' '{print $NF}')" = "${type}local" ] && unset ss_extra_arg
+		ssr)
+			lua $API_GEN_SS -node $node -local_addr "0.0.0.0" -local_port $local_port > $config_file
+			ln_start_bin "$(first_type ssr-redir)" "ssr-redir" $log_file -c "$config_file" -v -U
+		;;
+		ss)
+			local bin="ss-redir"
+			[ "$(config_n_get $node ss_rust 0)" = "1" ] && bin="sslocal"
 			lua $API_GEN_SS -node $node -local_addr "0.0.0.0" -local_port $local_port -protocol redir -mode udp_only > $config_file
-			ln_start_bin "$ss_program" "${type}-redir" $log_file -c "$config_file" -v $ss_extra_arg
+			ln_start_bin "$(first_type $bin ss-redir)" "$bin" $log_file -c "$config_file" -v
 		;;
 		esac
 	;;
@@ -467,8 +504,7 @@ run_redir() {
 		xray)
 			local loglevel=$(config_t_get global loglevel "warning")
 			local proto="-proto tcp"
-			[ "$UDP_NODE" == "tcp" ] && proto="-proto tcp,udp"
-			local extra_param="${proto}"
+			local extra_param=""
 			[ "$tcp_node_socks" = "1" ] && {
 				local socks_param="-socks_proxy_port $tcp_node_socks_port"
 				extra_param="${extra_param} ${socks_param}"
@@ -479,15 +515,32 @@ run_redir() {
 				extra_param="${extra_param} ${http_param}"
 				config_file=$(echo $config_file | sed "s/TCP/TCP_HTTP_$tcp_node_http_id/g")
 			}
+			[ "$TCP_UDP" = "1" ] && {
+				config_file=$(echo $config_file | sed "s/TCP/TCP_UDP/g")
+				proto="-proto tcp,udp"
+				UDP_REDIR_PORT=$TCP_REDIR_PORT
+				UDP_NODE="nil"
+			}
+			extra_param="${extra_param} ${proto}"
 			lua $API_GEN_XRAY -node $node -redir_port $local_port -loglevel $loglevel $extra_param > $config_file
 			ln_start_bin "$(first_type $(config_t_get global_app xray_file) xray)" xray $log_file -config="$config_file"
 		;;
 		trojan-go)
+			[ "$TCP_UDP" = "1" ] && {
+				config_file=$(echo $config_file | sed "s/TCP/TCP_UDP/g")
+				UDP_REDIR_PORT=$TCP_REDIR_PORT
+				UDP_NODE="nil"
+			}
 			local loglevel=$(config_t_get global trojan_loglevel "2")
 			lua $API_GEN_TROJAN -node $node -run_type nat -local_addr "0.0.0.0" -local_port $local_port -loglevel $loglevel > $config_file
 			ln_start_bin "$(first_type $(config_t_get global_app trojan_go_file) trojan-go)" trojan-go $log_file -config "$config_file"
 		;;
 		trojan*)
+			[ "$TCP_UDP" = "1" ] && {
+				config_file=$(echo $config_file | sed "s/TCP/TCP_UDP/g")
+				UDP_REDIR_PORT=$TCP_REDIR_PORT
+				UDP_NODE="nil"
+			}
 			local loglevel=$(config_t_get global trojan_loglevel "2")
 			lua $API_GEN_TROJAN -node $node -run_type nat -local_addr "0.0.0.0" -local_port $local_port -loglevel $loglevel > $config_file
 			ln_start_bin "$(first_type ${type})" "${type}" $log_file -c "$config_file"
@@ -499,46 +552,55 @@ run_redir() {
 		brook)
 			local server_ip=$server_host
 			local protocol=$(config_n_get $node protocol client)
-			local brook_tls=$(config_n_get $node brook_tls 0)
-			if [ "$protocol" == "wsclient" ]; then
-				[ "$brook_tls" == "1" ] && server_ip="wss://${server_ip}" || server_ip="ws://${server_ip}"
-				socks_port=$(get_new_port 2081 tcp)
-				ln_start_bin "$(first_type $(config_t_get global_app brook_file) brook)" "brook_tcp" $log_file wsclient --socks5 "127.0.0.1:$socks_port" -s "$server_ip:$port" -p "$(config_n_get $node password)"
-				_socks_flag=1
-				_socks_address="127.0.0.1"
-				_socks_port=$socks_port
-				echolog "Brook的WebSocket不支持透明代理，将使用ipt2socks转换透明代理！"
-				[ "$UDP_NODE" == "tcp" ] && echolog "Brook的WebSocket不支持UDP转发！"
-			else
-				[ "$kcptun_use" == "1" ] && {
-					server_ip=127.0.0.1
-					port=$KCPTUN_REDIR_PORT
-				}
-				ln_start_bin "$(first_type $(config_t_get global_app brook_file) brook)" "brook_tcp" $log_file tproxy -l ":$local_port" -s "$server_ip:$port" -p "$(config_n_get $node password)"
-			fi
+			local prefix=""
+			[ "$protocol" == "wsclient" ] && {
+				prefix="ws://"
+				local brook_tls=$(config_n_get $node brook_tls 0)
+				[ "$brook_tls" == "1" ] && prefix="wss://"
+				local ws_path=$(config_n_get $node ws_path "/ws")
+			}
+			[ "$kcptun_use" == "1" ] && {
+				server_ip=127.0.0.1
+				port=$KCPTUN_REDIR_PORT
+			}
+			server_ip=${prefix}${server_ip}
+			ln_start_bin "$(first_type $(config_t_get global_app brook_file) brook)" "brook_tcp" $log_file tproxy -l ":$local_port" -s "${server_ip}:${port}${ws_path}" -p "$(config_n_get $node password)" --doNotRunScripts
 		;;
-		ss|ssr)
-			ss_program="$(first_type ${type}local ${type}-redir)"
+		ssr)
+			if [ "$kcptun_use" == "1" ]; then
+				lua $API_GEN_SS -node $node -local_addr "0.0.0.0" -local_port $local_port -server_host "127.0.0.1" -server_port $KCPTUN_REDIR_PORT > $config_file
+			else
+				[ "$TCP_UDP" = "1" ] && {
+					config_file=$(echo $config_file | sed "s/TCP/TCP_UDP/g")
+					UDP_REDIR_PORT=$TCP_REDIR_PORT
+					UDP_NODE="nil"
+					extra_param="-u"
+				}
+				lua $API_GEN_SS -node $node -local_addr "0.0.0.0" -local_port $local_port > $config_file
+			fi
+			ln_start_bin "$(first_type ssr-redir)" "ssr-redir" $log_file -c "$config_file" -v $extra_param
+		;;
+		ss)
+			local bin="ss-redir"
+			[ "$(config_n_get $node ss_rust 0)" = "1" ] && bin="sslocal"
 			lua_mode_arg="-mode tcp_only"
 			if [ "$kcptun_use" == "1" ]; then
-				[ "$UDP_NODE" == "tcp" ] && echolog "Kcptun不支持UDP转发！"
 				lua $API_GEN_SS -node $node -local_addr "0.0.0.0" -local_port $local_port -server_host "127.0.0.1" -server_port $KCPTUN_REDIR_PORT -protocol redir $lua_mode_arg > $config_file
 			else
-				[ "$UDP_NODE" == "tcp" ] && {
-					ss_extra_arg="$ss_extra_arg -u"
-					[ "$(printf '%s' "$ss_program" | awk -F '/' '{print $NF}')" = "${type}local" ] && {
-						unset ss_extra_arg
-						lua_mode_arg="-mode tcp_and_udp"
-					}
+				[ "$TCP_UDP" = "1" ] && {
+					config_file=$(echo $config_file | sed "s/TCP/TCP_UDP/g")
+					UDP_REDIR_PORT=$TCP_REDIR_PORT
+					UDP_NODE="nil"
+					lua_mode_arg="-mode tcp_and_udp"
 				}
 				lua $API_GEN_SS -node $node -local_addr "0.0.0.0" -local_port $local_port -protocol redir $lua_mode_arg > $config_file
 			fi
-			ln_start_bin "$ss_program" "${type}-redir" $log_file -c "$config_file" -v $ss_extra_arg
+			ln_start_bin "$(first_type $bin ss-redir)" "$bin" $log_file -c "$config_file" -v
 		;;
 		esac
 		if [ -n "$_socks_flag" ]; then
 			local extra_param="-T"
-			[ "$UDP_NODE" == "tcp" ] && extra_param=""
+			[ "$TCP_UDP" = "1" ] && extra_param=""
 			ln_start_bin "$(first_type ipt2socks)" "ipt2socks_tcp" $log_file -l "$local_port" -b 0.0.0.0 -s "$_socks_address" -p "$_socks_port" -R -v $extra_param
 		fi
 		unset _socks_flag _socks_address _socks_port _socks_username _socks_password
@@ -553,7 +615,7 @@ run_redir() {
 				[ "$tcp_node_http" = "1" ] && {
 					http_port=$tcp_node_http_port
 				}
-				run_socks TCP $node "0.0.0.0" $port $config_file $http_port $http_config_file
+				run_socks $tcp_node_socks_id $node "0.0.0.0" $port $config_file $http_port $http_config_file
 			}
 		}
 	;;
@@ -565,34 +627,37 @@ node_switch() {
 	[ -n "$1" -a -n "$2" ] && {
 		local node=$2
 		top -bn1 | grep -E "$TMP_PATH" | grep -i "${1}" | grep -v "grep" | awk '{print $1}' | xargs kill -9 >/dev/null 2>&1
+		rm -rf $TMP_PATH/${1}*
 		local config_file=$TMP_PATH/${1}.json
 		local log_file=$TMP_PATH/${1}.log
 		eval current_port=\$${1}_REDIR_PORT
 		local port=$(cat $TMP_PORT_PATH/${1})
 
-		local ids=$(uci show $CONFIG | grep "=socks" | awk -F '.' '{print $2}' | awk -F '=' '{print $1}')
-		for id in $ids; do
-			[ "$(config_n_get $id enabled 0)" == "0" ] && continue
-			[ "$(config_n_get $id node nil)" != "tcp" ] && continue
-			local socks_port=$(config_n_get $id port)
-			local http_port=$(config_n_get $id http_port 0)
-			top -bn1 | grep -E "$TMP_PATH" | grep -i "SOCKS" | grep "$id" | grep -v "grep" | awk '{print $1}' | xargs kill -9 >/dev/null 2>&1
-			tcp_node_socks=1
-			tcp_node_socks_port=$socks_port
-			tcp_node_socks_id=$id
-			[ "$http_port" != "0" ] && {
-				tcp_node_http=1
-				tcp_node_http_port=$http_port
-				tcp_node_http_id=$id
-			}
-			break
-		done
+		[ "$SOCKS_ENABLED" = "1" ] && {
+			local ids=$(uci show $CONFIG | grep "=socks" | awk -F '.' '{print $2}' | awk -F '=' '{print $1}')
+			for id in $ids; do
+				[ "$(config_n_get $id enabled 0)" == "0" ] && continue
+				[ "$(config_n_get $id node nil)" != "tcp" ] && continue
+				local socks_port=$(config_n_get $id port)
+				local http_port=$(config_n_get $id http_port 0)
+				top -bn1 | grep -E "$TMP_PATH" | grep -i "SOCKS" | grep "$id" | grep -v "grep" | awk '{print $1}' | xargs kill -9 >/dev/null 2>&1
+				tcp_node_socks=1
+				tcp_node_socks_port=$socks_port
+				tcp_node_socks_id=$id
+				[ "$http_port" != "0" ] && {
+					tcp_node_http=1
+					tcp_node_http_port=$http_port
+					tcp_node_http_id=$id
+				}
+				break
+			done
+		}
 
 		run_redir $node "0.0.0.0" $port $config_file $1 $log_file
 		echo $node > $TMP_ID_PATH/${1}
 
 		[ "$1" = "TCP" ] && {
-			[ "$(config_t_get global udp_node nil)" = "tcp_" ] && {
+			[ "$(config_t_get global udp_node nil)" = "tcp" ] && [ "$UDP_REDIR_PORT" != "$TCP_REDIR_PORT" ] && {
 				top -bn1 | grep -E "$TMP_PATH" | grep -i "UDP" | grep -v "grep" | awk '{print $1}' | xargs kill -9 >/dev/null 2>&1
 				UDP_NODE=$node
 				start_redir UDP
@@ -850,7 +915,9 @@ start_dns() {
 				echolog "  | - [$?](chinadns-ng) 域名白名单合并到中国域名表"
 			}
 			chnlist_param=${chnlist_param:+-m "${chnlist_param}" -M}
-			ln_start_bin "$(first_type chinadns-ng)" chinadns-ng "${TMP_PATH}/chinadns-ng.log" -v -b 0.0.0.0 -l "${china_ng_listen_port}" ${china_ng_chn:+-c "${china_ng_chn}"} ${chnlist_param} ${china_ng_gfw:+-t "${china_ng_gfw}"} ${gfwlist_param:+-g "${gfwlist_param}"} -f
+			local log_path="${TMP_PATH}/chinadns-ng.log"
+			log_path="/dev/null"
+			ln_start_bin "$(first_type chinadns-ng)" chinadns-ng "$log_path" -v -b 0.0.0.0 -l "${china_ng_listen_port}" ${china_ng_chn:+-c "${china_ng_chn}"} ${chnlist_param} ${china_ng_gfw:+-t "${china_ng_gfw}"} ${gfwlist_param:+-g "${gfwlist_param}"} -f
 			echolog "  + 过滤服务：ChinaDNS-NG(:${china_ng_listen_port}) + ${msg}：国内DNS：${china_ng_chn:-D114.114.114.114}，可信DNS：${china_ng_gfw:-D8.8.8.8}"
 			#[ -n "${global}${chnlist}" ] && [ -z "${returnhome}" ] && TUN_DNS="${china_ng_gfw}"
 		}
@@ -867,6 +934,7 @@ gen_pdnsd_config() {
 	local perm_cache=2048
 	local _cache="on"
 	local query_method="tcp_only"
+	local reject_ipv6_dns=
 
 	mkdir -p "${pdnsd_dir}"
 	touch "${pdnsd_dir}/pdnsd.cache"
@@ -875,6 +943,14 @@ gen_pdnsd_config() {
 		query_method="udp_only"
 	else
 		use_tcp_node_resolve_dns=1
+	fi
+	if [ $PROXY_IPV6 == "0" ]; then
+		reject_ipv6_dns=$(cat <<- 'EOF'
+
+				reject = ::/0;
+				reject_policy = negate;
+		EOF
+		)
 	fi
 	[ "${DNS_CACHE}" = "0" ] && _cache="off" && perm_cache=0
 	cat > "${pdnsd_dir}/pdnsd.conf" <<-EOF
@@ -912,9 +988,7 @@ gen_pdnsd_config() {
 				uptest = none;
 				purge_cache = off;
 				proxy_only = on;
-				caching = $_cache;
-				reject = ::/0;
-				reject_policy = negate;
+				caching = $_cache;${reject_ipv6_dns}
 			}
 		EOF
 		echolog "  | - [$?]上游DNS：${2}:${3}"
